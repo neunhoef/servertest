@@ -139,12 +139,19 @@ class Server {
   void run() {
     while (true) {
       // Usual work:
-      for (size_t i = 0; i < clients.size(); ++i) {
-        uint32_t t = clients[i]->inTick.load(std::memory_order_acquire);
-        if (t != ticks[i]) {
-          ticks[i] = t;
-          clients[i]->work->dowork();
-          clients[i]->outTick.store(t, std::memory_order_release);
+      size_t s = clients.size();
+      if (s > 0) {
+        --s;
+        uint32_t prefetch = clients[0]->inTick.load(std::memory_order_relaxed);;
+        uint32_t t;
+        for (size_t i = 0; i < s; ++i) {
+          t = prefetch;
+          prefetch = clients[i+1]->inTick.load(std::memory_order_relaxed);
+          if (t != ticks[i]) {
+            ticks[i] = t;
+            clients[i]->work->dowork();
+            clients[i]->outTick.store(t, std::memory_order_relaxed);
+          }
         }
       }
 
@@ -152,6 +159,9 @@ class Server {
       if (changed.load(std::memory_order_relaxed) > 0) {
         // Mutex ensures memory barrier
         std::unique_lock<std::mutex> guard(mutex);
+        if (clients.size() > 0) {
+          clients.pop_back();  // Remove copy
+        }
         for (size_t i = 0; i < toRemove.size(); ++i) {
           for (size_t j = 0; j < clients.size(); ++j) {
             if (toRemove[i] == clients[j]) {
@@ -169,177 +179,25 @@ class Server {
           ticks.push_back(0);
         }
         newClients.clear();
+        if (clients.size() > 0) {
+          clients.push_back(clients.front());   // Copy first to end
+        }
         changed.store(0, std::memory_order_relaxed);  // under the mutex!
       }
 
       // Stop?
       if (stop.load(std::memory_order_relaxed) > 0) {
-        for (size_t i = 0; i < clients.size(); ++i) {
-          clients[i]->serverGone = 1;
+        if (clients.size() > 0) {
+          clients.pop_back();
+          for (size_t i = 0; i < clients.size(); ++i) {
+            clients[i]->serverGone = 1;
+          }
         }
         break;
       }
     }
   }
 };
-
-#if 0
-class Server {
- public:
-  struct alignas(128) Client {
-    std::atomic<uint32_t> inTick;  // starts as 0, an increase means that
-                                   // a new job has to be done
-    uint32_t what;    // indicates what to do
-    Work* work;
-    char padding[120 - sizeof(Work*)];
-    std::atomic<uint32_t> outTick;  // starts as 0, an increase means that
-                                    // a new answer is there
-    char padding2[124];
-    Client(Work* w) : inTick(0), what(0), work(w), outTick(0) { }
-  };
-
- private:
-  std::mutex mutex;
-  size_t maxNrClients;
-  Client** clients;
-  uint32_t* inTicks;
-  std::atomic<size_t> nrClients;
-  bool started;
-  std::thread server;
-
- public:
-  Server(size_t m) 
-    : maxNrClients(m), clients(new Client*[m]), inTicks(new uint32_t[m]),
-      nrClients(0), started(false), server(&Server::run, this) {
-  }
-
-  ~Server() {
-    if (nrClients > 0) {
-      std::cout << "Warning: Server has clients on destruction!" << std::endl;
-    }
-    server.join();
-    delete[] inTicks;
-    delete[] clients;
-  }
-
-  bool registerClient(Client* c) {
-    std::unique_lock<std::mutex> guard(mutex);
-    if (nrClients >= maxNrClients) {
-      return false;
-    }
-    clients[nrClients] = c;
-    inTicks[nrClients] = 0;
-    ++nrClients;
-    started = true;
-    return true;
-  }
-
-  void unregisterClient(Client* c) {
-    std::unique_lock<std::mutex> guard(mutex);
-    size_t i;
-    for (i = 0; i < nrClients; ++i) {
-      if (clients[i] == c) {
-        break;
-      }
-    }
-    if (i == nrClients) {
-      return;
-    }
-    clients[i] = clients[nrClients-1];
-    inTicks[i] = inTicks[nrClients-1];
-    --nrClients;
-  }
-
- private:
-
-  void run() {
-    while (true) {
-      switch (nrClients) {
-        case 1:
-          for (size_t j = 0; j < 100; ++j) {
-            uint32_t t = clients[0]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[0]) {
-              inTicks[0] = t;
-              clients[0]->work->dowork();
-              clients[0]->outTick.store(t, std::memory_order_release);
-            }
-          }
-          break;
-        case 2:
-          for (size_t j = 0; j < 100; ++j) {
-            uint32_t t = clients[0]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[0]) {
-              inTicks[0] = t;
-              clients[0]->work->dowork();
-              clients[0]->outTick.store(t, std::memory_order_release);
-            }
-            t = clients[1]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[1]) {
-              inTicks[1] = t;
-              clients[1]->work->dowork();
-              clients[1]->outTick.store(t, std::memory_order_release);
-            }
-          }
-          break;
-        case 3:
-          for (size_t j = 0; j < 100; ++j) {
-            uint32_t t = clients[0]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[0]) {
-              inTicks[0] = t;
-              clients[0]->work->dowork();
-              clients[0]->outTick.store(t, std::memory_order_release);
-            }
-            t = clients[1]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[1]) {
-              inTicks[1] = t;
-              clients[1]->work->dowork();
-              clients[1]->outTick.store(t, std::memory_order_release);
-            }
-            t = clients[2]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[2]) {
-              inTicks[2] = t;
-              clients[2]->work->dowork();
-              clients[2]->outTick.store(t, std::memory_order_release);
-            }
-          }
-          break;
-        case 4:
-          for (size_t j = 0; j < 100; ++j) {
-            uint32_t t = clients[0]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[0]) {
-              inTicks[0] = t;
-              clients[0]->work->dowork();
-              clients[0]->outTick.store(t, std::memory_order_release);
-            }
-            t = clients[1]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[1]) {
-              inTicks[1] = t;
-              clients[1]->work->dowork();
-              clients[1]->outTick.store(t, std::memory_order_release);
-            }
-            t = clients[2]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[2]) {
-              inTicks[2] = t;
-              clients[2]->work->dowork();
-              clients[2]->outTick.store(t, std::memory_order_release);
-            }
-            t = clients[3]->inTick.load(std::memory_order_acquire);
-            if (t != inTicks[3]) {
-              inTicks[3] = t;
-              clients[3]->work->dowork();
-              clients[3]->outTick.store(t, std::memory_order_release);
-            }
-          }
-          break;
-        case 0:
-          if (started) {
-            return;
-          }
-      }
-    }
-  }
-};
-#endif
 
 void clientThread(Server* server, Work* work, std::atomic<int>* stop,
                   uint64_t* count) {
@@ -351,8 +209,8 @@ void clientThread(Server* server, Work* work, std::atomic<int>* stop,
   uint32_t t = 0;
   while (stop->load(std::memory_order_relaxed) == 0) {
     for (size_t i = 0; i < perRound; ++i) {
-      cl->inTick.store(++t, std::memory_order_release);
-      while (cl->outTick.load(std::memory_order_acquire) != t) {
+      cl->inTick.store(++t, std::memory_order_relaxed);
+      while (cl->outTick.load(std::memory_order_relaxed) != t) {
       }
       ++c;
     }
