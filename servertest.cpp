@@ -95,6 +95,105 @@ class Server {
     char padding[120 - sizeof(Work*)];
     std::atomic<uint32_t> outTick;  // starts as 0, an increase means that
                                     // a new answer is there
+    std::atomic<uint32_t> serverGone;
+    char padding2[124];
+    Client(Work* w) : inTick(0), what(0), work(w), outTick(0), serverGone(0) { }
+  };
+
+ private:
+  std::mutex mutex;
+  std::vector<Client*> newClients;
+  std::vector<Client*> toRemove;
+  std::atomic<uint32_t> changed;  // increase to make the server look at lists
+  char padding[128];              // just to go to other cache line
+
+  std::vector<Client*> clients;
+  std::vector<uint32_t> ticks;
+  std::atomic<uint32_t> stop;
+  std::thread server;
+
+ public:
+  Server() 
+    : changed(0), stop(0), server(&Server::run, this) { }
+
+  ~Server() {
+    stop = 1;
+    server.join();
+  }
+
+  void registerClient(Client* c) {
+    std::unique_lock<std::mutex> guard(mutex);
+    newClients.push_back(c);
+    ++changed;
+  }
+
+  void unregisterClient(Client* c) {
+    {
+      std::unique_lock<std::mutex> guard(mutex);
+      toRemove.push_back(c);
+      ++changed;
+    }
+    while (changed > 0) {}
+  }
+
+  void run() {
+    while (true) {
+      // Usual work:
+      for (size_t i = 0; i < clients.size(); ++i) {
+        uint32_t t = clients[i]->inTick.load(std::memory_order_acquire);
+        if (t != ticks[i]) {
+          ticks[i] = t;
+          clients[i]->work->dowork();
+          clients[i]->outTick.store(t, std::memory_order_release);
+        }
+      }
+
+      // Look after changes:
+      if (changed.load(std::memory_order_relaxed) > 0) {
+        // Mutex ensures memory barrier
+        std::unique_lock<std::mutex> guard(mutex);
+        for (size_t i = 0; i < toRemove.size(); ++i) {
+          for (size_t j = 0; j < clients.size(); ++j) {
+            if (toRemove[i] == clients[j]) {
+              clients[j] = clients.back();
+              clients.pop_back();
+              ticks[j] = ticks.back();
+              ticks.pop_back();
+              break;
+            }
+          }
+        }
+        toRemove.clear();
+        for (size_t i = 0; i < newClients.size(); ++i) {
+          clients.push_back(newClients[i]);
+          ticks.push_back(0);
+        }
+        newClients.clear();
+        changed.store(0, std::memory_order_relaxed);  // under the mutex!
+      }
+
+      // Stop?
+      if (stop.load(std::memory_order_relaxed) > 0) {
+        for (size_t i = 0; i < clients.size(); ++i) {
+          clients[i]->serverGone = 1;
+        }
+        break;
+      }
+    }
+  }
+};
+
+#if 0
+class Server {
+ public:
+  struct alignas(128) Client {
+    std::atomic<uint32_t> inTick;  // starts as 0, an increase means that
+                                   // a new job has to be done
+    uint32_t what;    // indicates what to do
+    Work* work;
+    char padding[120 - sizeof(Work*)];
+    std::atomic<uint32_t> outTick;  // starts as 0, an increase means that
+                                    // a new answer is there
     char padding2[124];
     Client(Work* w) : inTick(0), what(0), work(w), outTick(0) { }
   };
@@ -240,7 +339,8 @@ class Server {
     }
   }
 };
- 
+#endif
+
 void clientThread(Server* server, Work* work, std::atomic<int>* stop,
                   uint64_t* count) {
   Server::Client* cl = new Server::Client(work);
@@ -249,7 +349,7 @@ void clientThread(Server* server, Work* work, std::atomic<int>* stop,
   uint64_t c = 0;
   size_t perRound = ceill(1e-5 / workTime);
   uint32_t t = 0;
-  while (stop->load() == 0) {
+  while (stop->load(std::memory_order_relaxed) == 0) {
     for (size_t i = 0; i < perRound; ++i) {
       cl->inTick.store(++t, std::memory_order_release);
       while (cl->outTick.load(std::memory_order_acquire) != t) {
@@ -368,8 +468,8 @@ int main(int argc, char* argv[]) {
   // Measure a delegating server:
   {
     std::cout << "Running in a single thread with delegation..." << std::endl;
+    Server server;  // start the server thread
     for (int j = 1; j <= threads; ++j) {
-      Server server(threads);  // start the server thread
       std::cout << "Using " << j << " threads:" << std::endl;
       std::atomic<int> stop(0);
       std::vector<std::thread> ts;
