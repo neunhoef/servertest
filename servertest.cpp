@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <xmmintrin.h>
 
 std::string pretty(uint64_t u) {
   if (u == 0) {
@@ -136,17 +137,33 @@ class Server {
     while (changed > 0) {}
   }
 
+  void duplicatePointers() {
+    size_t size = clients.size();
+    if (size > 0) {
+      for (size_t i = 0; i < size; ++i) {
+        clients.push_back(clients[i]);   // Copy first to end
+      }
+    }
+  }
+
+  void removeDuplicatePointers() {
+    size_t size = clients.size();
+    if (size > 0) {  // Remove all copies of the pointers:
+      for (size_t i = 0; i < size/2; ++i) {
+        clients.pop_back();  // Remove copy
+      }
+    }
+  }
+
   void run() {
     while (true) {
       // Usual work:
       size_t s = clients.size();
-      if (s > 0) {
-        --s;
-        uint32_t prefetch = clients[0]->inTick.load(std::memory_order_relaxed);;
-        uint32_t t;
-        for (size_t i = 0; i < s; ++i) {
-          t = prefetch;
-          prefetch = clients[i+1]->inTick.load(std::memory_order_relaxed);
+      if (s > 0) {  // s is always even!
+        size_t ss = s >> 1;
+        for (size_t i = 0; i < ss; ++i) {
+          _mm_prefetch(clients[i+ss], _mm_hint::_MM_HINT_T0);
+          uint32_t t = clients[i]->inTick.load(std::memory_order_relaxed);
           if (t != ticks[i]) {
             ticks[i] = t;
             clients[i]->work->dowork();
@@ -159,9 +176,7 @@ class Server {
       if (changed.load(std::memory_order_relaxed) > 0) {
         // Mutex ensures memory barrier
         std::unique_lock<std::mutex> guard(mutex);
-        if (clients.size() > 0) {
-          clients.pop_back();  // Remove copy
-        }
+        removeDuplicatePointers();
         for (size_t i = 0; i < toRemove.size(); ++i) {
           for (size_t j = 0; j < clients.size(); ++j) {
             if (toRemove[i] == clients[j]) {
@@ -179,16 +194,14 @@ class Server {
           ticks.push_back(0);
         }
         newClients.clear();
-        if (clients.size() > 0) {
-          clients.push_back(clients.front());   // Copy first to end
-        }
+        duplicatePointers();
         changed.store(0, std::memory_order_relaxed);  // under the mutex!
       }
 
       // Stop?
       if (stop.load(std::memory_order_relaxed) > 0) {
+        removeDuplicatePointers();
         if (clients.size() > 0) {
-          clients.pop_back();
           for (size_t i = 0; i < clients.size(); ++i) {
             clients[i]->serverGone = 1;
           }
